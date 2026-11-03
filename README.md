@@ -118,3 +118,9 @@ Evaluation metrics:
 - Mean Absolute Error (MAE)
 
 The best checkpoint is selected using validation RMSE and evaluated on the held-out test set.
+
+
+## Multi-step Forecasting
+
+The multi-step experiments use the same SPEC-Net backbone and model hyperparameter settings as the corresponding single-step experiments, with independent linear output heads for each prediction horizon.
+
