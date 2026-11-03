@@ -1,166 +1,100 @@
+
+from pathlib import Path
 import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Tuple
 
-from config import cfg
 
-# -------------------------
-# seed / device
-# -------------------------
-def set_seed(seed=42):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def to_device(x):
-    return x.to(cfg.DEVICE, non_blocking=True)
 
-# -------------------------
-# shape utils
-# -------------------------
-def standardize_to_grid_or_node4d(a: np.ndarray) -> np.ndarray:
-    if a.ndim == 4:
-        return a
-    if a.ndim == 3:
-        T, N, C = a.shape
-        return a.reshape(T, 1, N, C)
-    if a.ndim == 2:
-        T, N = a.shape
-        return a.reshape(T, 1, N, 1)
-    raise ValueError(f"Unsupported input shape: {a.shape}")
+def load_milan(train_path: str, test_path: str, channels=(0, 1, 2)):
+    for value, label in [(train_path, "--train"), (test_path, "--test")]:
+        if not value or not Path(value).is_file():
+            raise FileNotFoundError(f"{label} must point to an existing .npy file: {value!r}")
+    train = np.load(train_path, mmap_mode="r")
+    test = np.load(test_path, mmap_mode="r")
+    if train.ndim != 4 or test.ndim != 4:
+        raise ValueError("Milan data must have shape (time, height, width, channels)")
+    if train.shape[1:] != test.shape[1:] or train.shape[1:3] != (100, 100):
+        raise ValueError(f"Expected matching Milan 100x100 grids: {train.shape}, {test.shape}")
+    if not channels or min(channels) < 0 or max(channels) >= train.shape[-1]:
+        raise ValueError(f"Invalid channels {channels} for {train.shape[-1]} input channels")
+    if not np.issubdtype(train.dtype, np.number) or not np.issubdtype(test.dtype, np.number):
+        raise TypeError("Data arrays must be numeric")
+    return train, test
 
-def is_grid4d(a: np.ndarray) -> bool:
-    return (a.ndim == 4 and a.shape[1] > 1 and a.shape[2] > 1)
 
-# -------------------------
-# crop / channel select
-# -------------------------
-def crop_data(arr: np.ndarray, crop_mode: str, crop_size: int, seed: int = None, crop_box: Tuple[int,int,int,int] = None) -> np.ndarray:
-    if arr.ndim != 4:
-        raise ValueError(f"Expected 4D, got {arr.shape}")
-    T, H_orig, W_orig, C = arr.shape
+def split_train_val(train, p: int):
+    split = int(len(train) * 0.9)
+    if split <= p or len(train) - split <= p:
+        raise ValueError("Each chronological train/validation partition needs > P observations")
+    return train[:split], train[split:]
 
-    if crop_box is not None:
-        h0, h1, w0, w1 = map(int, crop_box)
-        h0 = int(max(0, min(h0, H_orig)))
-        h1 = int(max(0, min(h1, H_orig)))
-        w0 = int(max(0, min(w0, W_orig)))
-        w1 = int(max(0, min(w1, W_orig)))
-        return arr[:, h0:h1, w0:w1, :]
 
-    if crop_mode == "none":
-        return arr
-    if crop_size > min(H_orig, W_orig):
-        return arr
+class MilanWindowDataset(Dataset):
+    def __init__(self, array, p, channels):
+        if len(array) <= p:
+            raise ValueError(f"Need more than {p} time steps, got {len(array)}")
+        self.array, self.p, self.channels = array, p, list(channels)
 
-    if crop_mode == "center":
-        center_h, center_w = H_orig // 2, W_orig // 2
-        half_crop = crop_size // 2
-        start_h = center_h - half_crop
-        start_w = center_w - half_crop
-    elif crop_mode == "top_left":
-        start_h, start_w = 0, 0
-    elif crop_mode == "bottom_right":
-        start_h = H_orig - crop_size
-        start_w = W_orig - crop_size
-    elif crop_mode == "random":
-        if seed is not None:
-            np.random.seed(seed)
-        start_h = np.random.randint(0, H_orig - crop_size + 1)
-        start_w = np.random.randint(0, W_orig - crop_size + 1)
-    else:
-        raise ValueError(f"Unknown crop_mode: {crop_mode}")
-
-    start_h = max(0, min(start_h, H_orig - crop_size))
-    start_w = max(0, min(start_w, W_orig - crop_size))
-    end_h = start_h + crop_size
-    end_w = start_w + crop_size
-    return arr[:, start_h:end_h, start_w:end_w, :]
-
-def select_channels(arr: np.ndarray, channels: list, channel_names: list = None) -> np.ndarray:
-    return arr[..., channels]
-
-# -------------------------
-# windowing
-# -------------------------
-def sliding_windows(arr: np.ndarray, p_in: int) -> Tuple[np.ndarray, np.ndarray]:
-    T = arr.shape[0]
-    N = T - p_in
-    X = np.stack([arr[i:i+p_in] for i in range(N)], axis=0)
-    y = np.stack([arr[i+p_in] for i in range(N)], axis=0)
-    return X, y
-
-# -------------------------
-# normalization
-# -------------------------
-def norm_fit(x_train: np.ndarray):
-    min_v = x_train.min(axis=(0,1,2), keepdims=True)
-    max_v = x_train.max(axis=(0,1,2), keepdims=True)
-    return min_v, max_v
-
-def norm_apply(x: torch.Tensor, min_v: torch.Tensor, max_v: torch.Tensor, eps: float = 1e-6):
-    scale = (max_v - min_v)
-    scale = torch.where(scale < eps, torch.ones_like(scale), scale)
-    return (x - min_v) / (scale + eps)
-
-def denorm(x: torch.Tensor, min_v: torch.Tensor, max_v: torch.Tensor, eps: float = 1e-6):
-    return min_v + x * (max_v - min_v + eps)
-
-# -------------------------
-# coords + knn
-# -------------------------
-def make_grid_coords_np(H: int, W: int) -> np.ndarray:
-    yy, xx = np.meshgrid(
-        np.linspace(-1, 1, H, dtype=np.float32),
-        np.linspace(-1, 1, W, dtype=np.float32),
-        indexing="ij"
-    )
-    coords = np.stack([yy, xx], axis=-1).reshape(-1, 2)
-    return coords.astype(np.float32)
-
-def make_line_coords_np(N: int) -> np.ndarray:
-    x = np.linspace(-1, 1, N, dtype=np.float32)
-    y = np.zeros_like(x)
-    return np.stack([y, x], axis=-1).astype(np.float32)
-
-def build_knn_from_coords(coords: torch.Tensor, k: int):
-    N = coords.size(0)
-    d2 = torch.cdist(coords, coords, p=2.0)**2
-    d2 = d2 + torch.eye(N, device=coords.device) * 1e9
-    idx = torch.topk(-d2, k, dim=-1).indices
-    rel = coords.unsqueeze(1) - coords[idx]
-    geo = rel.norm(dim=-1)
-    return idx, rel, geo
-
-def build_knn_idx_and_relpos(H, W, k, device):
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij"
-    )
-    coords = torch.stack([yy, xx], dim=-1).reshape(-1,2).float()
-    N = coords.size(0)
-    d2 = torch.cdist(coords, coords, p=2.0)**2
-    d2 = d2 + torch.eye(N, device=device)*1e9
-    idx = torch.topk(-d2, k, dim=-1).indices
-    rel = coords.unsqueeze(1) - coords[idx]
-    rel[...,0] = 2*rel[...,0]/max(1,(H-1))
-    rel[...,1] = 2*rel[...,1]/max(1,(W-1))
-    geo = rel.norm(dim=-1)
-    return idx, rel, geo, coords
-
-# -------------------------
-# Dataset
-# -------------------------
-class WinDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = X.astype(np.float32)
-        self.y = y.astype(np.float32)
     def __len__(self):
-        return self.X.shape[0]
-    def __getitem__(self, i):
-        return torch.from_numpy(self.X[i]), torch.from_numpy(self.y[i])
+        return len(self.array) - self.p
 
+    def __getitem__(self, i):
+        x = np.take(np.asarray(self.array[i:i+self.p], dtype=np.float32), self.channels, axis=-1)
+        y = np.take(np.asarray(self.array[i+self.p], dtype=np.float32), self.channels, axis=-1)
+        if not (np.isfinite(x).all() and np.isfinite(y).all()):
+            raise ValueError(f"Non-finite data in sample index {i}; preprocess missing values before training")
+        return torch.from_numpy(x.copy()), torch.from_numpy(y.copy())
+
+
+def train_only_min_max(train, channels):
+    lo, hi = [], []
+    for c in channels:
+        values = np.asarray(train[..., c])
+        if not np.isfinite(values).all():
+            raise ValueError("Training data contain NaN/Inf; perform paper preprocessing first")
+        lo.append(float(values.min()))
+        hi.append(float(values.max()))
+    return torch.tensor(lo, dtype=torch.float32).view(1, 1, 1, 1, -1), torch.tensor(hi, dtype=torch.float32).view(1, 1, 1, 1, -1)
+
+
+def normalize(x, lo, hi):
+    return (x - lo) / (hi - lo).clamp_min(1e-6)
+
+
+def denormalize(x, lo, hi):
+    return x * (hi - lo).clamp_min(1e-6) + lo
+
+
+def grid_coordinates(h, w, device):
+    yy, xx = torch.meshgrid(torch.linspace(-1,1,h,device=device), torch.linspace(-1,1,w,device=device), indexing="ij")
+    return torch.stack([yy, xx], dim=-1).reshape(-1, 2)
+
+
+def grid_neighbors(h, w, k, device):
+    if k != 8:
+        raise ValueError("This publication supplies the paper's fixed K_nn=8 only")
+    candidates = [(dy,dx) for dy in range(-2,3) for dx in range(-2,3) if dy or dx]
+    # Stable deterministic tie breaker. Radius-2 is sufficient for k=8 even at corners.
+    candidates.sort(key=lambda z: (z[0]**2+z[1]**2, z[0], z[1]))
+    ys, xs = torch.meshgrid(torch.arange(h,device=device), torch.arange(w,device=device), indexing='ij')
+    yy = ys.flatten(); xx = xs.flatten()
+    n=h*w
+    scores=[]; ids=[]
+    for dy, dx in candidates:
+        ny=yy+dy; nx=xx+dx
+        ok=(ny>=0)&(ny<h)&(nx>=0)&(nx<w)
+        scores.append(torch.where(ok, torch.full((n,), float(dy*dy+dx*dx), device=device), torch.full((n,),float('inf'),device=device)))
+        ids.append((ny.clamp(0,h-1)*w+nx.clamp(0,w-1)))
+    order=torch.topk(torch.stack(scores,dim=-1), k=k, largest=False).indices
+    nbr=torch.gather(torch.stack(ids,dim=-1),1,order)
+    rel=torch.stack([(yy[:,None]-yy[nbr])*2/max(h-1,1), (xx[:,None]-xx[nbr])*2/max(w-1,1)],dim=-1).float()
+    return nbr, rel, rel.norm(dim=-1)
