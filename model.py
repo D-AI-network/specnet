@@ -459,3 +459,21 @@ class SPECNet(nn.Module):
         )
 
         return prediction, tv
+class DirectMultiStepDecoder(nn.Module):
+    def __init__(self, d_model, c_out, out_len):
+        super().__init__()
+        self.out_len = out_len
+        self.out_heads = nn.ModuleList([
+            nn.Linear(d_model, c_out)
+            for _ in range(out_len)
+        ])
+
+    def forward(self, h, last_input):
+        B, N, D = h.shape
+        deltas = torch.stack(
+            [head(h) for head in self.out_heads],
+            dim=1
+        )
+        return last_input.unsqueeze(1) + deltas.reshape(
+            B, self.out_len, *last_input.shape[1:]
+        )
