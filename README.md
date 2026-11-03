@@ -1,167 +1,120 @@
-# SpecTra-Net
+# SPEC-Net
 
-**SpecTra-Net** is a PyTorch framework for spatiotemporal forecasting in complex network. It supports both **grid** (`T,H,W,C`) and **node** (`T,N,C`) inputs through a unified pipeline, and combines spectral-temporal conditioning with optimal-transport-based spatial alignment.
+PyTorch implementation of **SPEC-Net: Mobile Traffic Forecasting via Spectral Frequency Encoding and Prototype Alignment**.
 
----
+SPEC-Net combines spectral feature extraction, temporal gating, prototype alignment, and multi-scale graph attention for spatiotemporal forecasting.
 
-## 1. Key Components
+## 1. Architecture
 
-1. **SFE (Spectral Feature Extraction)**  
-   FFT-based frequency processing to stabilize/retain informative high-frequency patterns.
+- **SFE (Spectral Frequency Encoder):** Processes non-redundant FFT frequency components using frequency-specific MLPs.
+- **T-Gating (Temporal Gating):** Computes temporal weights based on multi-lag traffic changes.
+- **GPA (Global Prototype Alignment):** Learns global spatial representations through feature similarity and geometric distance.
+- **M-GAT (Multi-scale Graph Attention):** Models local spatial interactions using prototype assignments and multi-scale attention.
 
-2. **T-Gating (Temporal Gating)**  
-   Learns temporal importance weights and adaptively emphasizes change-sensitive time steps.
+## 2. Requirements
 
-3. **GAP (Graph Prototype Alignment)**  
-   Learns global spatial alignment via prototypes using geometry and embedding distance.
-
-4. **MGAT (Multi-Graph Attention)**  
-   Refines spatial representations on a KNN graph with anisotropic, scale-aware attention.
-
----
-
-## 2. Features
-
-- **Unified Input Support:** Grid (`T,H,W,C`) and Node (`T,N,C` or `T,N`) formats.
-- **Safe Cropping:** Cropping is applied only for grid inputs; node inputs are automatically preserved.
-- **Residual Forecasting:** Optional residual-to-last prediction (`y = last_input + delta`).
-- **Metrics:** RMSE, MAE, R2.
-- **Artifacts:** Saves best checkpoint + test predictions + JSON summary.
-
----
-
-## 3. Requirements
-
-- Python 3.8+
-- PyTorch >= 1.10
+- Python 3.10+
+- PyTorch
 - NumPy
 
-**Optional (recommended):**
-- CUDA-capable GPU for faster training
-
----
-
-## 4. Installation
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
+```
 
+## 3. Data Format
 
-## 5. Data Format
+The implementation uses grid-based time series stored as NumPy arrays (`.npy`).
 
-You provide two .npy arrays:
+Input format:
 
-TRAIN_NPY: training period (chronologically split into train/val = 9:1)
-
-TEST_NPY: test period (held-out)
-
-Supported raw shapes
-
-Grid input
-
+```text
 (T, H, W, C)
+```
 
-Node input
+- `T`: Number of time steps
+- `H, W`: Spatial dimensions (100 × 100)
+- `C`: Number of channels
 
-(T, N, C) or (T, N)
+Two files are required:
 
-Internally, node inputs are standardized to:
+```text
+train.npy
+test.npy
+```
 
-(T, 1, N, C) or (T, 1, N, 1).
+The training period is chronologically divided into training and validation sets using a 9:1 ratio.
 
-Forecasting setup (one-step ahead)
+For one-step forecasting with input length `P`:
 
-Given P_IN = P, sliding windows are created as:
+```text
+Input:  (B, P, H, W, C)
+Output: (B, H, W, C)
+```
 
-X[i] = data[i : i+P]
+Min-Max normalization uses statistics computed from the training partition.
 
-y[i] = data[i+P]
-
-So the windowed tensors become:
-
-X: (T-P, P, H, W, C) (grid) or (T-P, P, 1, N, C) (node-view)
-
-y: (T-P, H, W, C) (grid) or (T-P, 1, N, C) (node-view)
-
-##6. Quick Start
-
-Set file paths in the script:
-
-cfg.TRAIN_NPY = "path/to/train.npy"
-cfg.TEST_NPY  = "path/to/test.npy"
-
-
-Choose channels (examples):
-
-cfg.CHANNELS = [0]       # single channel
-# cfg.CHANNELS = [0,1,2] # multi-channel
-cfg.C = len(cfg.CHANNELS)
-
-
-Select view mode:
-
-cfg.NODE_MODE = True   # node view (recommended for (T,N,C) data)
-# cfg.NODE_MODE = False # grid view (requires grid-shaped input)
-
-
-(Optional) Provide coordinates for node datasets:
-
-cfg.COORDS_NPY = None  # or "path/to/coords.npy" with shape (N,2)
-
+## 4. Training
 
 Run:
 
-python train.py
+```bash
+python train.py --train path/to/train.npy --test path/to/test.npy
+```
 
-## 7. Configuration Notes
+Specify an output directory:
 
-Important options in CFG:
+```bash
+python train.py --train path/to/train.npy --test path/to/test.npy --save-dir ./checkpoints
+```
 
-Temporal
+Optional micro-batch size:
 
-P_IN: input window length
+```bash
+python train.py --train path/to/train.npy --test path/to/test.npy --micro-batch 2
+```
 
-USE_TGATING, TGATING_GAIN
+Training uses AdamW, CosineAnnealingLR, gradient clipping, and Early Stopping based on validation RMSE.
 
-USE_SFE, NUM_FREQUENCIES
+The training objective combines Huber loss, frequency-weighted loss, quantile loss, and spatial regularization.
 
-PERIODS: periodic embedding periods (default [48, 168])
+## 5. Configuration
 
-Spatial
+Model and training parameters are defined in `config.py`.
 
-USE_GAP, N_PROTO, GOT_EPS, GOT_TAU, GOT_USE_EMB_DIST
+Main settings include:
 
-USE_MGAT, DLAK_K, MGAT_R0
+- `P_IN`: Input sequence length
+- `D_MODEL`: Hidden dimension
+- `NUM_FREQUENCIES`: Frequency encoder capacity
+- `N_PROTO`: Number of prototypes
+- `K_NN`: Number of candidate neighbors
+- `SCALES`: Spatial attention radii
+- `LAGS`: Temporal lag configuration
+- `BATCH`: Batch size
+- `EPOCHS`: Maximum training epochs
+- `LR`: Learning rate
+- `WD`: Weight decay
+- `EARLY_STOP_PATIENCE`: Early Stopping patience
+- `SEED`: Random seed
 
-Training
+## 6. Outputs
 
-BATCH, EPOCHS, LR, WD
+The training script saves:
 
-SEED, SAVE_DIR
+```text
+checkpoints/
+├── specnet_best.pt
+├── history.csv
+├── results.json
+├── test_predictions.npy
+└── test_targets.npy
+```
 
-## 8. Outputs
+Evaluation metrics:
 
-During training, the script saves the best checkpoint (by validation global RMSE) into:
+- Root Mean Squared Error (RMSE)
+- Mean Absolute Error (MAE)
 
-SAVE_DIR/spectranet_<crop>_<channel>_NODE.pt (node mode)
-
-SAVE_DIR/spectranet_<crop>_<channel>.pt (grid mode)
-
-It also saves:
-
-*_y_pred_test.npy: test predictions
-
-*_y_true_test.npy: test ground truth
-
-*_results.json: full config + metrics summary
-
-## 9. Metrics
-
-The evaluation reports:
-
-RMSE
-
-MAE
-
-R²
-
+The best checkpoint is selected using validation RMSE and evaluated on the held-out test set.
