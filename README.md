@@ -122,5 +122,11 @@ The best checkpoint is selected using validation RMSE and evaluated on the held-
 
 ## Multi-step Forecasting
 
+The multi-step forecasting experiments use the same model architecture and hyperparameter settings as the single-step experiments. Only the output layer is extended to predict multiple future steps using independent linear projections for each forecasting horizon.
+
+
+
+## Multi-step Forecasting
+
 The multi-step experiments use the same SPEC-Net backbone and model hyperparameter settings as the corresponding single-step experiments, with independent linear output heads for each prediction horizon.
 
