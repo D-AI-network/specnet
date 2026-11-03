@@ -5,9 +5,9 @@ import torch
 
 @dataclass
 class CFG:
-    TRAIN_NPY: str = ""  
-    TEST_NPY: str = ""  
-    CHANNELS: Tuple[int, ...] = (0, 1, 2)  # SMS, Call, Internet
+    TRAIN_NPY: str = ""
+    TEST_NPY: str = ""
+    CHANNELS: Tuple[int, ...] = (0, 1, 2)
     P_IN: int = 25
     H: int = 100
     W: int = 100
@@ -17,7 +17,7 @@ class CFG:
     LR: float = 5e-4
     WD: float = 1e-3
     D_MODEL: int = 128
-    NUM_FREQUENCIES: int = 13  
+    NUM_FREQUENCIES: int = 13
     PERIODS: Tuple[int, ...] = (48, 168)
     N_PROTO: int = 128
     K_NN: int = 8
@@ -39,7 +39,7 @@ class CFG:
     TV_W: float = 0.001
     SEED: int = 42
     NUM_WORKERS: int = 0
-    SAVE_DIR: str = "./runs/milan"
+    SAVE_DIR: str = "./runs/default"
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
