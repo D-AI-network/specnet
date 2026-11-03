@@ -1,390 +1,214 @@
-import os, json, time
+
+import argparse
+import csv
+import json
+import math
+import os
+import time
+from dataclasses import asdict
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from config import cfg
-from data import (
-    set_seed, to_device,
-    standardize_to_grid_or_node4d, is_grid4d,
-    crop_data, select_channels, sliding_windows,
-    norm_fit, norm_apply, denorm,
-    make_grid_coords_np, make_line_coords_np,
-    WinDataset
-)
-from model import SpecTraNet, compute_gating_signal
+from data import (MilanWindowDataset, denormalize, load_milan, normalize,
+                  set_seed, split_train_val, train_only_min_max)
+from model import SPECNet
 
-import warnings
-warnings.filterwarnings("ignore")
 
-# -------------------------
-# metrics / losses
-# -------------------------
-def compute_metrics(y_true, y_pred, eps=1e-8):
-    B,H,W,C = y_true.shape
-    yt = y_true.reshape(B,-1,C); yp = y_pred.reshape(B,-1,C)
-    diff = yp - yt
-    mse = (diff**2).mean(dim=1).mean(dim=0)
-    rmse = torch.sqrt(mse + eps)
-    mae  = diff.abs().mean(dim=1).mean(dim=0)
-    smape= ( (yp-yt).abs() / (yt.abs()+yp.abs()+eps) ).mean(dim=1).mean(dim=0)
-    yt_mean = yt.mean(dim=1, keepdim=True)
-    ss_tot  = ((yt-yt_mean)**2).sum(dim=1).mean(dim=0)
-    ss_res  = (diff**2).sum(dim=1).mean(dim=0)
-    r2 = 1 - ss_res/(ss_tot+eps)
-    rmse_g = torch.sqrt(((diff**2).mean()))
-    mae_g  = diff.abs().mean()
-    smape_g= ( (yp-yt).abs() / (yt.abs()+yp.abs()+eps) ).mean()
-    r2_g   = 1 - (diff**2).sum() / (((yt-yt.mean())**2).sum()+eps)
-    return {
-        "per_channel": {
-            "rmse": rmse.detach().cpu().tolist(),
-            "mae":  mae.detach().cpu().tolist(),
-            "smape": smape.detach().cpu().tolist(),
-            "r2":   r2.detach().cpu().tolist(),
-        },
-        "global": {
-            "rmse": float(rmse_g.detach().cpu()),
-            "mae":  float(mae_g.detach().cpu()),
-            "smape": float(smape_g.detach().cpu()),
-            "r2":   float(r2_g.detach().cpu()),
+def frequency_loss(y, prediction):
+    err = (torch.fft.rfft2(y.permute(0,3,1,2))
+           - torch.fft.rfft2(prediction.permute(0,3,1,2))).abs()
+    h,w=y.shape[1:3]
+    rows=torch.linspace(-1,1,h,device=y.device)
+    cols=torch.linspace(-1,1,w,device=y.device)
+    radius=torch.sqrt(rows[:,None]**2+cols[None,:]**2)[:,:w//2+1]
+    weight=torch.exp(-3*radius)
+    return (err*weight[None,None,:,:]).mean()
+
+
+def pinball(y,pred,tau):
+    delta=y-pred
+    return torch.maximum(tau*delta,(tau-1)*delta).mean()
+
+
+def compute_loss(y, pred, tv):
+    huber=nn.functional.huber_loss(pred,y,delta=cfg.LOSS_DELTA)
+    freq=frequency_loss(y,pred)
+    quantile=sum(pinball(y,pred,t) for t in (0.2,0.5,0.8))/3
+    # Keep all four terms: identical weights to the paper's stated objective.
+    return huber + cfg.FREQ_LOSS_W*freq + cfg.PINBALL_W*quantile + cfg.TV_W*tv
+
+
+class Metrics:
+    def __init__(self,channels):
+        self.channels=channels
+        self.squared=torch.zeros(channels,dtype=torch.float64)
+        self.absolute=torch.zeros(channels,dtype=torch.float64)
+        self.points=0
+
+    def add(self,actual,prediction):
+        error=(prediction-actual).detach().to(torch.float64).cpu()
+        self.squared+=(error*error).sum(dim=(0,1,2))
+        self.absolute+=error.abs().sum(dim=(0,1,2))
+        self.points+=error.shape[0]*error.shape[1]*error.shape[2]
+
+    def result(self):
+        if self.points==0:
+            raise ValueError('No observations were evaluated')
+        mse=self.squared/self.points
+        mae=self.absolute/self.points
+        return {
+            'rmse':math.sqrt(float(self.squared.sum()/(self.points*self.channels))),
+            'mae':float(self.absolute.sum()/(self.points*self.channels)),
+            'per_channel_rmse':mse.sqrt().tolist(),
+            'per_channel_mae':mae.tolist(),
+            'evaluated_steps':self.points,
         }
-    }
 
-def freq_weighted_loss(y, mu, eps=1e-8):
-    yf = torch.fft.rfft2(y.permute(0, 3, 1, 2))
-    mf = torch.fft.rfft2(mu.permute(0, 3, 1, 2))
-    df = yf - mf
-    H = y.shape[1]; W = y.shape[2]
-    Hf, Wf = df.shape[2], df.shape[3]
-    yy = torch.linspace(-1, 1, H, device=y.device).unsqueeze(1).expand(H, W)
-    xx = torch.linspace(-1, 1, W, device=y.device).unsqueeze(0).expand(H, W)
-    r = torch.sqrt(yy**2 + xx**2)[:Hf, :Wf]
-    w_low = torch.exp(-3.0 * r)
-    Wmap = w_low.unsqueeze(0).unsqueeze(0)
-    fw = (Wmap * df.abs()).mean()
-    return fw
 
-def pinball_loss(y, yhat, tau):
-    return torch.maximum(tau*(y - yhat), (tau-1)*(y - yhat)).mean()
+def to_device(batch,device):
+    return batch.to(device,non_blocking=(device.type=='cuda'))
 
-# -------------------------
-# train / eval
-# -------------------------
-def train_one_epoch(model, loader, min_v, max_v, optim):
+
+def optimize_epoch(model,loader,minimum,maximum,optimizer,device,micro_batch):
     model.train()
-    loss_fn = nn.HuberLoss(delta=cfg.LOSS_DELTA)
-    total = 0.0
-    for X,y in loader:
-        X = to_device(X); y = to_device(y)
-        gating_hint = compute_gating_signal(X) if cfg.USE_TGATING else None
-        Xn = norm_apply(X, min_v, max_v)
-        yn = norm_apply(y, min_v, max_v)
-        yp, reg_loss = model(Xn, gating_hint=gating_hint)
+    weighted_loss=0.0
+    num_examples=0
+    for x,y in loader:
+        batch_n=len(x)
+        optimizer.zero_grad(set_to_none=True)
+        batch_loss=0.0
+        for xx,yy in zip(x.split(micro_batch),y.split(micro_batch)):
+            xx=to_device(xx,device)
+            yy=to_device(yy,device)
+            normalized_x=normalize(xx,minimum,maximum)
+            normalized_y=normalize(yy,minimum[:,0],maximum[:,0])
+            pred,tv=model(normalized_x,raw_input=xx)
+            loss=compute_loss(normalized_y,pred,tv)
+            # Accumulate a mathematically correct global mean for the batch.
+            (loss*(len(xx)/batch_n)).backward()
+            batch_loss+=float(loss.detach())*len(xx)/batch_n
+        torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
+        optimizer.step()
+        weighted_loss+=batch_loss*batch_n
+        num_examples+=batch_n
+    return weighted_loss/max(num_examples,1)
 
-        huber = loss_fn(yp, yn)
-        fw = freq_weighted_loss(yn, yp) if cfg.USE_SFE else torch.tensor(0.0, device=yp.device)
-        q_loss = (pinball_loss(yn, yp, 0.2) + pinball_loss(yn, yp, 0.5) + pinball_loss(yn, yp, 0.8)) / 3.0 if cfg.USE_QLOSS else torch.tensor(0.0, device=yp.device)
-        loss = huber + reg_loss + 0.1 * fw + cfg.Q_W * q_loss
-
-        optim.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optim.step()
-
-        total += float(loss.detach().cpu())
-    return total/len(loader)
 
 @torch.no_grad()
-def eval_model(model, loader, min_v, max_v):
+def evaluate(model,loader,minimum,maximum,device,collect=False):
     model.eval()
-    loss_fn = nn.HuberLoss(delta=cfg.LOSS_DELTA)
-    total = 0.0
-    all_pred, all_true = [], []
-    for X, y in loader:
-        X = to_device(X); y = to_device(y)
-        gating_hint = compute_gating_signal(X) if cfg.USE_TGATING else None
-        Xn = norm_apply(X, min_v, max_v)
-        yn = norm_apply(y, min_v, max_v)
-        yp, reg_loss = model(Xn, gating_hint=gating_hint)
+    totals=Metrics(model.channels)
+    pred_list=[]
+    true_list=[]
+    weighted_loss=0.0
+    n_examples=0
+    for x,y in loader:
+        xx=to_device(x,device)
+        yy=to_device(y,device)
+        xn=normalize(xx,minimum,maximum)
+        yn=normalize(yy,minimum[:,0],maximum[:,0])
+        yp,tv=model(xn,raw_input=xx)
+        loss=compute_loss(yn,yp,tv)
+        raw_pred=denormalize(yp,minimum[:,0],maximum[:,0])
+        totals.add(yy,raw_pred)
+        weighted_loss+=float(loss)*len(x)
+        n_examples+=len(x)
+        if collect:
+            pred_list.append(raw_pred.cpu().numpy())
+            true_list.append(yy.cpu().numpy())
+    return weighted_loss/max(n_examples,1),totals.result(),(pred_list,true_list)
 
-        huber = loss_fn(yp, yn)
-        fw = freq_weighted_loss(yn, yp) if cfg.USE_SFE else torch.tensor(0.0, device=yp.device)
-        q_loss = (pinball_loss(yn, yp, 0.2) + pinball_loss(yn, yp, 0.5) + pinball_loss(yn, yp, 0.8)) / 3.0 if cfg.USE_QLOSS else torch.tensor(0.0, device=yp.device)
-        loss = huber + reg_loss + 0.1 * fw + cfg.Q_W * q_loss
 
-        total += float(loss.detach().cpu())
-        ypd = denorm(yp, min_v, max_v)
-        all_pred.append(ypd.cpu())
-        all_true.append(y.cpu())
-
-    y_pred = torch.cat(all_pred, dim=0)
-    y_true = torch.cat(all_true, dim=0)
-    metrics = compute_metrics(y_true, y_pred)
-    return total / len(loader), metrics
-
-# -------------------------
-# main
-# -------------------------
-def main():
-    os.makedirs(cfg.SAVE_DIR, exist_ok=True)
+def run(train_npy,test_npy,save_dir,micro_batch=2):
+    if micro_batch<1 or micro_batch>cfg.BATCH:
+        raise ValueError('micro_batch must be in [1, 32]')
     set_seed(cfg.SEED)
-
-    print("Device:", cfg.DEVICE)
-    print("SpecTra-Net (Grid+Node unified, SFE, TGATING, GOT, MGAT)")
-    print("Loading data...")
-
-    tr_raw = np.load(cfg.TRAIN_NPY)
-    te_raw = np.load(cfg.TEST_NPY)
-    print(f"Raw train shape: {tr_raw.shape}")
-    print(f"Raw test  shape: {te_raw.shape}")
-
-    raw_is_grid = is_grid4d(tr_raw)
-    tr_full = standardize_to_grid_or_node4d(tr_raw)
-    te_full = standardize_to_grid_or_node4d(te_raw)
-
-    print(f"Standardized train shape: {tr_full.shape}")
-    print(f"Standardized test  shape: {te_full.shape}")
-
-    cfg.H_ORIG = tr_full.shape[1]
-    cfg.W_ORIG = tr_full.shape[2]
-    cfg.C_ORIG = tr_full.shape[3]
-
-    if cfg.C_ORIG == 3:
-        channel_names_all = ["SMS", "Call", "Internet"]
-    else:
-        channel_names_all = [f"Ch{i}" for i in range(cfg.C_ORIG)]
-
-    if cfg.CHANNELS is None:
-        cfg.CHANNELS = list(range(cfg.C_ORIG))
-    cfg.C = len(cfg.CHANNELS)
-    selected_channel_names = [channel_names_all[i] for i in cfg.CHANNELS]
-    print(f"Channels: {cfg.CHANNELS} ({selected_channel_names})")
-
-    # chronological split: 9:1 from training period
-    T_total = tr_full.shape[0]
-    T_tr = int(T_total * 0.9)
-    tr_train = tr_full[:T_tr]
-    tr_val   = tr_full[T_tr:]
-
-    tr_train = select_channels(tr_train, cfg.CHANNELS, channel_names_all)
-    tr_val   = select_channels(tr_val,   cfg.CHANNELS, channel_names_all)
-    te       = select_channels(te_full,  cfg.CHANNELS, channel_names_all)
-
-    # crop only when grid
-    if (not cfg.USE_CROP) or (not is_grid4d(tr_train)):
-        crop_str = "full" if not cfg.USE_CROP else "skipCrop(node)"
-        tr_train_p = tr_train
-        tr_val_p   = tr_val
-        te_p       = te
-        if cfg.USE_CROP and (not is_grid4d(tr_train)):
-            print("NOTE: Input is node-view; cropping is skipped safely.")
-    else:
-        if cfg.CROP_BOX is None:
-            crop_str = f"{cfg.CROP_MODE}{cfg.CROP_SIZE}"
-            tr_train_p = crop_data(tr_train, cfg.CROP_MODE, cfg.CROP_SIZE, seed=cfg.SEED, crop_box=None)
-            tr_val_p   = crop_data(tr_val,   cfg.CROP_MODE, cfg.CROP_SIZE, seed=cfg.SEED, crop_box=None)
-            te_p       = crop_data(te,       cfg.CROP_MODE, cfg.CROP_SIZE, seed=cfg.SEED, crop_box=None)
-        else:
-            h0,h1,w0,w1 = cfg.CROP_BOX
-            crop_str = f"boxH{h0}-{h1}_W{w0}-{w1}"
-            tr_train_p = crop_data(tr_train, "box", cfg.CROP_SIZE, seed=cfg.SEED, crop_box=cfg.CROP_BOX)
-            tr_val_p   = crop_data(tr_val,   "box", cfg.CROP_SIZE, seed=cfg.SEED, crop_box=cfg.CROP_BOX)
-            te_p       = crop_data(te,       "box", cfg.CROP_SIZE, seed=cfg.SEED, crop_box=cfg.CROP_BOX)
-
-    coords_t = None
-
-    # node-mode handling
-    if cfg.NODE_MODE:
-        if tr_train_p.shape[1] == 1:
-            N = int(tr_train_p.shape[2])
-            print(f"NODE_MODE=ON: already node-view (T,1,{N},C)")
-        else:
-            Hc, Wc = int(tr_train_p.shape[1]), int(tr_train_p.shape[2])
-            N = Hc * Wc
-            print(f"NODE_MODE=ON: grid->node (T,{Hc},{Wc},C) -> (T,1,{N},C)")
-
-            def grid_to_node_view(a):
-                T = a.shape[0]
-                return a.reshape(T, 1, Hc*Wc, a.shape[-1])
-
-            tr_train_p = grid_to_node_view(tr_train_p)
-            tr_val_p   = grid_to_node_view(tr_val_p)
-            te_p       = grid_to_node_view(te_p)
-
-        if cfg.COORDS_NPY is not None:
-            coords_np = np.load(cfg.COORDS_NPY).astype(np.float32)
-            if coords_np.ndim != 2 or coords_np.shape[0] != N:
-                raise ValueError(f"COORDS_NPY must be (N,2) with N={N}, got {coords_np.shape}")
-            if coords_np.shape[1] != 2:
-                coords_np = coords_np[:, :2]
-        else:
-            if raw_is_grid and (tr_raw.ndim == 4 and tr_raw.shape[1] > 1 and tr_raw.shape[2] > 1):
-                coords_np = make_grid_coords_np(Hc, Wc) if ('Hc' in locals() and 'Wc' in locals()) else make_line_coords_np(N)
-            else:
-                coords_np = make_line_coords_np(N)
-
-        coords_t = torch.from_numpy(coords_np)
-        cfg.H = 1
-        cfg.W = N
-    else:
-        if tr_train_p.shape[1] == 1:
-            raise ValueError("NODE_MODE=False but input is node-view (T,1,N,C). Set NODE_MODE=True for node data.")
-        cfg.H = int(tr_train_p.shape[1])
-        cfg.W = int(tr_train_p.shape[2])
-        print(f"NODE_MODE=OFF: using grid view (T,{cfg.H},{cfg.W},C)")
-
-    # windowing
-    Xtr,  ytr  = sliding_windows(tr_train_p, cfg.P_IN)
-    Xval, yval = sliding_windows(tr_val_p,   cfg.P_IN)
-    Xte,  yte  = sliding_windows(te_p,       cfg.P_IN)
-
-    # normalization
-    min_np, max_np = norm_fit(tr_train_p)
-    min_v = torch.from_numpy(min_np.astype(np.float32)).to(cfg.DEVICE)
-    max_v = torch.from_numpy(max_np.astype(np.float32)).to(cfg.DEVICE)
-
-    # dataloaders
-    from torch.utils.data import DataLoader
-    ds_tr  = WinDataset(Xtr,  ytr)
-    ds_val = WinDataset(Xval, yval)
-    ds_te  = WinDataset(Xte,  yte)
-
-    dl_tr  = DataLoader(ds_tr,  batch_size=cfg.BATCH, shuffle=True,  num_workers=cfg.NUM_WORKERS, pin_memory=cfg.PIN_MEMORY)
-    dl_val = DataLoader(ds_val, batch_size=cfg.BATCH, shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=cfg.PIN_MEMORY)
-    dl_te  = DataLoader(ds_te,  batch_size=cfg.BATCH, shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=cfg.PIN_MEMORY)
-
-    print(f"Creating SpecTra-Net: H={cfg.H}, W={cfg.W}, C={cfg.C}, P={cfg.P_IN} | crop={crop_str} | NODE_MODE={cfg.NODE_MODE}")
-
-    model = SpecTraNet(cfg.H, cfg.W, cfg.C, cfg.P_IN, coords=coords_t).to(cfg.DEVICE)
-    optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.LR, weight_decay=cfg.WD)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=cfg.EPOCHS)
-
-    # naming
-    if len(cfg.CHANNELS) == 1:
-        channel_str = f"ch{cfg.CHANNELS[0]}"
-    elif len(cfg.CHANNELS) == cfg.C_ORIG:
-        channel_str = "allch"
-    else:
-        channel_str = f"ch{'_'.join(map(str, cfg.CHANNELS))}"
-
-    model_name = f"spectranet_{crop_str}_{channel_str}"
-    model_name += "_NODE.pt" if cfg.NODE_MODE else ".pt"
-    best_path = os.path.join(cfg.SAVE_DIR, model_name)
-
-    best_rmse = 1e9
-    print("\n=== Starting Training ===")
-    print(f"Model will be saved as: {model_name}")
-
-    for ep in range(1, cfg.EPOCHS + 1):
-        t0 = time.time()
-        tr_loss = train_one_epoch(model, dl_tr, min_v, max_v, optim)
-        va_loss, va_metrics = eval_model(model, dl_val, min_v, max_v)
+    out=Path(save_dir)
+    out.mkdir(parents=True,exist_ok=True)
+    train_full,test=load_milan(train_npy,test_npy,cfg.CHANNELS)
+    train,val=split_train_val(train_full,cfg.P_IN)
+    print(f'Milan one step: train={len(train)}, val={len(val)}, test={len(test)} timestamps; P={cfg.P_IN}')
+    print(f'Input shape={train_full.shape[1:]}, channels={cfg.CHANNELS}, actual FFT bins={cfg.P_IN//2+1}')
+    if len(test)!=168:
+        print('WARNING: paper describes a 168-hour (7-day) Milan holdout; supplied test has',len(test),'observations')
+    if train_full.shape[0]+test.shape[0]!=1464:
+        print('WARNING: paper reports 1464 total hourly Milan timestamps; confirm source/preprocessing.')
+    tr_ds=MilanWindowDataset(train,cfg.P_IN,cfg.CHANNELS)
+    val_ds=MilanWindowDataset(val,cfg.P_IN,cfg.CHANNELS)
+    te_ds=MilanWindowDataset(test,cfg.P_IN,cfg.CHANNELS)
+    loader_kw={'num_workers':cfg.NUM_WORKERS,'pin_memory':cfg.DEVICE.startswith('cuda')}
+    tr_dl=DataLoader(tr_ds,batch_size=cfg.BATCH,shuffle=True,**loader_kw)
+    # Validation/test use micro-batches to reduce memory use; metrics cover all examples.
+    val_dl=DataLoader(val_ds,batch_size=micro_batch,shuffle=False,**loader_kw)
+    te_dl=DataLoader(te_ds,batch_size=micro_batch,shuffle=False,**loader_kw)
+    minimum,maximum=train_only_min_max(train,cfg.CHANNELS)
+    device=torch.device(cfg.DEVICE)
+    minimum=minimum.to(device)
+    maximum=maximum.to(device)
+    model=SPECNet(cfg.H,cfg.W,len(cfg.CHANNELS),cfg.P_IN).to(device)
+    print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}; device={device}; effective batch={cfg.BATCH}, micro={micro_batch}')
+    opt=torch.optim.AdamW(model.parameters(),lr=cfg.LR,weight_decay=cfg.WD)
+    scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=cfg.EPOCHS)
+    best=float('inf'); best_epoch=0; stale=0
+    history=[]
+    ckpt=out/'specnet_milan_best.pt'
+    tic=time.perf_counter()
+    for epoch in range(1,cfg.EPOCHS+1):
+        e0=time.perf_counter()
+        train_loss=optimize_epoch(model,tr_dl,minimum,maximum,opt,device,micro_batch)
+        val_loss,metric,_=evaluate(model,val_dl,minimum,maximum,device)
         scheduler.step()
+        row={'epoch':epoch,'train_loss':train_loss,'val_loss':val_loss,
+             'val_rmse':metric['rmse'],'val_mae':metric['mae'],
+             'lr':opt.param_groups[0]['lr'],'epoch_sec':time.perf_counter()-e0}
+        history.append(row)
+        if metric['rmse']<best-1e-10:
+            best=metric['rmse'];best_epoch=epoch;stale=0
+            torch.save({'model':model.state_dict(),'config':asdict(cfg),
+                        'minimum':minimum.cpu(),'maximum':maximum.cpu(),
+                        'epoch':epoch,'best_val_rmse':best},ckpt)
+        else:
+            stale+=1
+        print(f"epoch={epoch:03d} train={train_loss:.6f} val={val_loss:.6f} "
+              f"valRMSE={metric['rmse']:.4f} best={best:.4f} patience={stale}/{cfg.EARLY_STOP_PATIENCE}",flush=True)
+        if stale>=cfg.EARLY_STOP_PATIENCE:
+            print('Early stopping triggered')
+            break
+    with (out/'history.csv').open('w',newline='') as fp:
+        writer=csv.DictWriter(fp,fieldnames=list(history[0]))
+        writer.writeheader();writer.writerows(history)
+    # No test-set peeking before checkpoint selection.
+    saved=torch.load(ckpt,map_location=device,weights_only=True)
+    model.load_state_dict(saved['model'])
+    test_loss,test_metrics,predictions=evaluate(model,te_dl,minimum,maximum,device,collect=True)
+    np.save(out/'test_predictions.npy',np.concatenate(predictions[0],axis=0))
+    np.save(out/'test_targets.npy',np.concatenate(predictions[1],axis=0))
+    summary={'best_epoch':best_epoch,'best_val_rmse':best,'epochs_ran':len(history),
+             'train_time_sec':time.perf_counter()-tic,'test_loss':test_loss,
+             'test_metrics':test_metrics,'config':asdict(cfg),'micro_batch':micro_batch,
+             'split':{'train_observations':len(train),'val_observations':len(val),
+                      'test_observations':len(test),
+                      'train_windows':len(tr_ds),'val_windows':len(val_ds),'test_windows':len(te_ds)}}
+    (out/'results.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+    print(json.dumps({'best_epoch':best_epoch,'test_metrics':test_metrics},indent=2))
+    return summary
 
-        rmse_g = va_metrics["global"]["rmse"]
-        r2_g   = va_metrics["global"]["r2"]
 
-        if rmse_g < best_rmse:
-            best_rmse = rmse_g
-            torch.save({
-                "model": model.state_dict(),
-                "cfg": cfg.__dict__,
-                "min": min_v.cpu().numpy(),
-                "max": max_v.cpu().numpy(),
-                "channels": cfg.CHANNELS,
-                "channel_names": selected_channel_names,
-                "coords_npy": cfg.COORDS_NPY
-            }, best_path)
+def main():
+    parser=argparse.ArgumentParser(description='Paper-aligned SPEC-Net Milan one-step training')
+    parser.add_argument('--train',required=True,help='Preprocessed Milan data before last 7 days, .npy')
+    parser.add_argument('--test',required=True,help='Held-out last 7 days, .npy')
+    parser.add_argument('--save-dir',default=cfg.SAVE_DIR)
+    parser.add_argument('--micro-batch',type=int,default=2,
+                        help='Gradient accumulation micro-batch; effective batch remains 32')
+    args=parser.parse_args()
+    run(args.train,args.test,args.save_dir,args.micro_batch)
 
-        print(f"[Ep {ep:03d}] train={tr_loss:.4f} | val={va_loss:.4f} | "
-              f"RMSEg={rmse_g:.4f} | R2g={r2_g:.4f} | "
-              f"lr={optim.param_groups[0]['lr']:.2e} | time={time.time()-t0:.1f}s")
 
-    print(f"\nBest model saved to: {best_path}")
-    print(f"Best RMSE (on val): {best_rmse:.6f}")
-
-    ckpt = torch.load(best_path, map_location=cfg.DEVICE, weights_only=False)
-    model.load_state_dict(ckpt["model"])
-
-    test_loss, test_metrics = eval_model(model, dl_te, min_v, max_v)
-
-    # save prediction arrays
-    model.eval()
-    all_pred_te, all_true_te = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in dl_te:
-            X_batch = to_device(X_batch)
-            y_batch = to_device(y_batch)
-            gating_hint = compute_gating_signal(X_batch) if cfg.USE_TGATING else None
-            Xn_batch = norm_apply(X_batch, min_v, max_v)
-            yp_batch, _ = model(Xn_batch, gating_hint=gating_hint)
-            ypd_batch = denorm(yp_batch, min_v, max_v)
-            all_pred_te.append(ypd_batch.cpu().numpy())
-            all_true_te.append(y_batch.cpu().numpy())
-
-    y_pred_test = np.concatenate(all_pred_te, axis=0)
-    y_true_test = np.concatenate(all_true_te, axis=0)
-
-    npy_pred_path = best_path.replace(".pt", "_y_pred_test.npy")
-    npy_true_path = best_path.replace(".pt", "_y_true_test.npy")
-    np.save(npy_pred_path, y_pred_test)
-    np.save(npy_true_path, y_true_test)
-
-    print(f"Saved TEST prediction array to: {npy_pred_path}")
-    print(f"Saved TEST ground-truth array to: {npy_true_path}")
-
-    # print metrics
-    global_metrics = test_metrics.get("global", {})
-    per_channel = test_metrics.get("per_channel", None)
-
-    print("\n=== Final Metrics (Test set) ===")
-    print("Global metrics:")
-    for k in ["rmse", "mae", "smape", "r2"]:
-        if k in global_metrics:
-            print(f"  {k.upper()}: {global_metrics[k]:.6f}")
-
-    print("\nPer-channel metrics:")
-    if per_channel is not None and all(m in per_channel for m in ["rmse", "mae", "smape", "r2"]):
-        for i, (ch_idx, ch_name) in enumerate(zip(cfg.CHANNELS, selected_channel_names)):
-            rmse_i  = per_channel["rmse"][i]
-            mae_i   = per_channel["mae"][i]
-            smape_i = per_channel["smape"][i]
-            r2_i    = per_channel["r2"][i]
-            print(f"  [{ch_idx}] {ch_name}: RMSE={rmse_i:.6f}, MAE={mae_i:.6f}, SMAPE={smape_i:.6f}, R2={r2_i:.6f}")
-
-    # save results json
-    results = {
-        "config": cfg.__dict__,
-        "channels": cfg.CHANNELS,
-        "channel_names": selected_channel_names,
-        "best_rmse_val": best_rmse,
-        "final_metrics": test_metrics
-    }
-    results_path = best_path.replace('.pt', '_results.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"Detailed results saved to: {results_path}")
-
-if __name__ == "__main__":
-    # keep user-style default overrides
-    cfg.TRAIN_NPY = ""
-    cfg.TEST_NPY  = ""
-    cfg.CHANNELS = [0]
-    cfg.C = len(cfg.CHANNELS)
-
-    cfg.USE_CROP  = False
-    cfg.CROP_MODE = "center"
-    cfg.CROP_SIZE = 20
-    cfg.CROP_BOX  = None
-
-    cfg.NODE_MODE = True
-    cfg.COORDS_NPY = None
-
-    cfg.USE_SFE = True
-    cfg.USE_TGATING = True
-    cfg.USE_GOT = True
-    cfg.USE_MGAT = True
-
+if __name__=='__main__':
     main()
-
